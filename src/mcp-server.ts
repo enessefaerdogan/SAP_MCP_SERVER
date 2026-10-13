@@ -4,6 +4,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomUUID } from "node:crypto";
+import {
+    ArtifactToolRegistry
+} from './tools/artifact-tool-registry.js';
 import 'dotenv/config';
 import { DestinationService } from './services/destination-service.js';
 import { SAPClient } from './services/sap-client.js';
@@ -18,6 +21,7 @@ export class MCPServer {
     private sapClient: SAPClient;
     private discoveredServices: ODataService[];
     private mcpServer: McpServer;
+    private artifactToolRegistry: ArtifactToolRegistry;
     private toolRegistry: HierarchicalSAPToolRegistry | SAPToolRegistry;
     private userToken?: string;
 
@@ -31,6 +35,10 @@ export class MCPServer {
             name: "btp-sap-odata-to-mcp-server",
             version: "2.0.0"
         });
+        this.artifactToolRegistry = new ArtifactToolRegistry(
+    this.mcpServer,
+    this.logger
+);
         this.mcpServer.server.onerror = (error) => {
             this.logger.error('MCP Server Error:', error);
             ErrorHandler.handle(error);
@@ -59,7 +67,7 @@ export class MCPServer {
         this.logger.debug(`User token ${token ? 'set' : 'cleared'} for MCP server`);
     }
 
-    async initialize(): Promise<void> {
+    /*async initialize(): Promise<void> {
         try {
             // Check which registry type we're using
             if (this.toolRegistry instanceof HierarchicalSAPToolRegistry) {
@@ -76,7 +84,42 @@ export class MCPServer {
             this.logger.error('❌ Failed to initialize server:', error);
             throw error;
         }
+    }*/
+
+        async initialize(): Promise<void> {
+    try {
+
+        // SAP MCP tools
+        if (this.toolRegistry instanceof HierarchicalSAPToolRegistry) {
+
+            this.toolRegistry.registerServiceMetadataResources();
+
+            await this.toolRegistry.registerDiscoveryTools();
+
+        } else if (this.toolRegistry instanceof SAPToolRegistry) {
+
+            this.toolRegistry.registerServiceMetadataResources();
+
+            await this.toolRegistry.registerServiceCRUDTools();
+        }
+
+        // PDF / Word / TXT artifact tool
+        this.artifactToolRegistry.registerTools();
+
+        this.logger.info(
+            '🔧 Registered MCP tools for SAP operations and artifacts'
+        );
+
+    } catch (error) {
+
+        this.logger.error(
+            '❌ Failed to initialize server:',
+            error
+        );
+
+        throw error;
     }
+}
 
     async connectStdio(): Promise<void> {
         const transport = new StdioServerTransport();
@@ -90,7 +133,7 @@ export class MCPServer {
     }): StreamableHTTPServerTransport {
         return new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
-            enableDnsRebindingProtection: options?.enableDnsRebindingProtection || true,
+            enableDnsRebindingProtection: options?.enableDnsRebindingProtection ?? true,
             allowedHosts: options?.allowedHosts || ['127.0.0.1', 'localhost']
         });
     }

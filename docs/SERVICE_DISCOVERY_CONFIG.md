@@ -19,7 +19,7 @@ ODATA_SERVICE_PATTERNS=ZBP*,ZTRANSPORT*,ZBC_UI_PARAM_E_CDS*
 ODATA_EXCLUSION_PATTERNS=*_TEST*,*_TEMP*,*_DEBUG*
 
 # Maximum number of services to discover
-ODATA_MAX_SERVICES=50
+ODATA_MAX_SERVICES=500
 
 # Discovery mode
 ODATA_DISCOVERY_MODE=whitelist
@@ -128,7 +128,7 @@ The system validates configuration and provides warnings for:
 If no configuration is provided, the system uses these defaults:
 - Service patterns: `["ZBP*", "ZTRANSPORT*", "ZBC_UI_PARAM_E_CDS*"]`
 - No exclusion patterns
-- Maximum 50 services
+- Maximum 500 services
 - Whitelist discovery mode
 
 ## Best Practices

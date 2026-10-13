@@ -15,6 +15,7 @@ import { SAPDiscoveryService } from './services/sap-discovery.js';
 import { ODataService } from './types/sap-types.js';
 import { ServiceDiscoveryConfigService } from './services/service-discovery-config.js';
 import { AuthService, AuthRequest } from './services/auth-service.js';
+import { artifactStore } from './services/artifact-store.js';
 
 // Global type extensions
 declare global {
@@ -48,7 +49,61 @@ const sapClient = new SAPClient(destinationService, logger);
 const sapDiscoveryService = new SAPDiscoveryService(sapClient, logger, config);
 const serviceConfigService = new ServiceDiscoveryConfigService(config, logger);
 const authService = new AuthService(logger, config);
+/*let discoveredServices: ODataService[] = [];*/
 let discoveredServices: ODataService[] = [];
+let discoveryReady = false;
+let discoveryError: string | null = null;
+let discoveryPromise: Promise<void> | null = null;
+
+async function ensureDiscoveryReady(): Promise<void> {
+    if (discoveryReady && discoveredServices.length > 0) {
+        return;
+    }
+
+    if (discoveryPromise) {
+        await discoveryPromise;
+        return;
+    }
+
+    discoveryPromise = (async () => {
+        try {
+            discoveryReady = false;
+            discoveryError = null;
+
+            logger.info('🔍 Initializing SAP destination and discovering OData services...');
+
+            await destinationService.initialize();
+
+            const services = await sapDiscoveryService.discoverAllServices();
+
+            if (!services || services.length === 0) {
+                throw new Error('SAP OData discovery completed but no usable services were found');
+            }
+
+            discoveredServices = services;
+            discoveryReady = true;
+
+            logger.info(`✅ SAP discovery completed: ${discoveredServices.length} OData services`);
+
+        } catch (error) {
+            discoveryReady = false;
+
+            discoveryError =
+                error instanceof Error
+                    ? error.message
+                    : String(error);
+
+            logger.error(`❌ SAP discovery failed: ${discoveryError}`);
+
+            throw error;
+
+        } finally {
+            discoveryPromise = null;
+        }
+    })();
+
+    await discoveryPromise;
+}
 
 // Session storage for HTTP transport with user context
 const sessions: Map<string, {
@@ -100,6 +155,9 @@ async function getOrCreateSession(sessionId?: string, userToken?: string): Promi
 
     try {
         // Create and initialize MCP server with user token if available
+        //const mcpServer = await createMCPServer(discoveredServices, userToken);
+        await ensureDiscoveryReady();
+
         const mcpServer = await createMCPServer(discoveredServices, userToken);
 
         // Create HTTP transport
@@ -182,14 +240,1191 @@ export function createApp(): express.Application {
     });
 
     // Health check endpoint
-    app.get('/health', (req, res) => {
+    /*app.get('/health', (req, res) => {
         res.json({
             status: 'healthy',
             timestamp: new Date().toISOString(),
             activeSessions: sessions.size,
             version: process.env.npm_package_version || '1.0.0'
         });
+    });*/
+    app.get('/health', (req, res) => {
+        res.json({
+            status: 'healthy',
+            timestamp: new Date().toISOString(),
+            activeSessions: sessions.size,
+            discoveryReady,
+            discoveredServices: discoveredServices.length,
+            discoveryError,
+            version: process.env.npm_package_version || '1.0.0'
+        });
     });
+
+    // Claude test endpoint
+    app.post('/api/ask', async (req, res) => {
+    try {
+
+        /*
+         * --------------------------------------------------------
+         * 1. REQUEST VALIDATION
+         * --------------------------------------------------------
+         */
+
+        const query = req.body?.query;
+
+        if (
+            !query ||
+            typeof query !== 'string' ||
+            query.trim().length === 0
+        ) {
+            return res.status(400).json({
+                error: 'query is required'
+            });
+        }
+
+
+        /*
+         * --------------------------------------------------------
+         * 2. SAP DISCOVERY READY CHECK
+         * --------------------------------------------------------
+         */
+
+        try {
+
+            await ensureDiscoveryReady();
+
+        } catch (error) {
+
+            return res.status(503).json({
+                error: 'SAP service discovery is not ready',
+
+                message:
+                    discoveryError ||
+                    (
+                        error instanceof Error
+                            ? error.message
+                            : String(error)
+                    ),
+
+                discoveredServices:
+                    discoveredServices.length
+            });
+        }
+
+
+        /*
+         * --------------------------------------------------------
+         * 3. ENVIRONMENT VARIABLES
+         * --------------------------------------------------------
+         */
+
+        const apiKey =
+            process.env.ANTHROPIC_API_KEY;
+
+        const mcpServerUrl =
+            process.env.MCP_SERVER_URL;
+
+
+        if (!apiKey) {
+
+            return res.status(500).json({
+                error:
+                    'ANTHROPIC_API_KEY is not configured'
+            });
+        }
+
+
+        if (!mcpServerUrl) {
+
+            return res.status(500).json({
+                error:
+                    'MCP_SERVER_URL is not configured'
+            });
+        }
+
+
+        /*
+         * --------------------------------------------------------
+         * 4. ANTHROPIC REQUEST
+         * --------------------------------------------------------
+         */
+
+        const body = {
+
+            model:
+                'claude-sonnet-4-6',
+
+            max_tokens:
+                6000,
+
+
+            system: `
+You are an SAP assistant connected to a real SAP system through the sap-mcp MCP server.
+
+For questions about SAP data, OData services, entities, metadata or SAP operations, use the sap-mcp tools.
+
+Never invent SAP services, entities, properties, values or records.
+
+Use only information returned by the connected SAP MCP server when answering SAP-specific questions.
+
+If the user asks for OData services, use the MCP discovery tools.
+
+If the user asks to list OData services, return the actual discovered service names.
+
+If the user asks for entities or properties of a service, inspect that service through MCP before answering.
+
+If an SAP or MCP operation fails, clearly report the real error instead of guessing.
+
+Do not claim that no SAP services are available unless the MCP tool actually reports zero available services.
+
+When the user explicitly asks for a PDF, Word document, text file,
+downloadable report, export or generated document:
+
+1. Retrieve all required SAP data first using the SAP MCP tools.
+
+2. Analyze the returned SAP data before creating the report.
+
+3. Create a professional report structure appropriate for the user's request.
+
+4. Use the create-report-artifact MCP tool.
+
+5. Do NOT send Markdown syntax such as #, ##, **, |---| or Markdown tables
+inside report text.
+
+6. Build the report using structured blocks supported by the tool:
+
+- heading:
+  Use for report sections.
+
+- paragraph:
+  Use for explanations, analysis and conclusions.
+
+- keyValue:
+  Use for metadata, service information, totals and important facts.
+
+- table:
+  Use for structured SAP records, entities, properties and business data.
+
+- bullets:
+  Use for findings, recommendations and summaries.
+
+7. Choose the structure intelligently based on the SAP data.
+Do not mechanically dump the raw response into the report.
+
+8. For tables, provide column names in "columns" and actual values in "rows".
+
+9. Include a concise summary when useful.
+
+10. Use human-readable titles instead of raw technical output whenever possible,
+while preserving actual SAP technical identifiers when relevant.
+
+11. Never invent SAP data. Every factual SAP value must come from MCP results.
+
+12. Do not generate base64 yourself.
+
+13. Do not claim that a file was generated unless create-report-artifact succeeds.
+
+14. After the artifact is successfully created, briefly tell the user that the file is ready.
+
+PERFORMANCE AND AUTO-DISCOVERY RULES:
+
+The end user is not expected to know technical SAP OData service names,
+entity set names, SAP object names or API paths.
+
+When the user describes a business request in natural language:
+
+1. Automatically determine the most relevant SAP OData service.
+2. Prefer already discovered/cached service information.
+3. Never ask the user for an OData service name if it can be discovered.
+4. Minimize MCP tool calls.
+5. Never repeat service discovery during the same user request.
+6. Inspect metadata only when necessary.
+7. Once a likely service and entity set are identified, query them directly.
+8. Reuse information returned by previous MCP calls.
+9. Do not inspect multiple services unless the first candidate is clearly unsuitable.
+10. Do not perform unnecessary metadata calls after the required entity set is known.
+
+For data requests:
+- Prefer one direct entity query after identifying the service.
+- Use a default maximum of 100 records unless the user explicitly asks for all records.
+
+For report requests:
+- Retrieve the SAP data first.
+- Then immediately call create-report-artifact.
+- Do not repeat SAP discovery after the data has been retrieved.
+
+For natural-language SAP requests:
+
+- The end user is NOT expected to know OData service names or entity names.
+- Never ask the user to provide an OData technical name if it can be discovered.
+- Convert the user's business intent into short likely SAP/English technical search terms for discover-sap-data.
+- Example: "bekleyen faturalar" -> search terms such as "invoice".
+- Example: "satış siparişleri" -> "sales order".
+- Example: "çalışanlar" -> "employee".
+- Call discover-sap-data only once unless its result is genuinely ambiguous.
+- discover-sap-data already returns complete entity schemas.
+- After successful discovery, call execute-sap-operation directly.
+- Do NOT call get-entity-metadata after successful discovery.
+`,
+
+
+            messages: [
+                {
+                    role: 'user',
+                    content: query.trim()
+                }
+            ],
+
+
+            mcp_servers: [
+                {
+                    type: 'url',
+                    url: mcpServerUrl,
+                    name: 'sap-mcp'
+                }
+            ],
+
+
+            tools: [
+                {
+                    type: 'mcp_toolset',
+                    mcp_server_name: 'sap-mcp'
+                }
+            ]
+        };
+
+
+        /*
+         * --------------------------------------------------------
+         * 5. CALL ANTHROPIC
+         * --------------------------------------------------------
+         */
+
+        const anthropicResponse =
+            await fetch(
+                'https://api.anthropic.com/v1/messages',
+                {
+                    method: 'POST',
+
+                    headers: {
+                        'content-type':
+                            'application/json',
+
+                        'x-api-key':
+                            apiKey,
+
+                        'anthropic-version':
+                            '2023-06-01',
+
+                        'anthropic-beta':
+                            'mcp-client-2025-11-20'
+                    },
+
+                    body:
+                        JSON.stringify(body)
+                }
+            );
+
+
+        const responseText =
+            await anthropicResponse.text();
+
+
+        let data: any;
+
+
+        try {
+
+            data =
+                JSON.parse(responseText);
+
+        } catch {
+
+            logger.error(
+                `Anthropic returned invalid JSON: ${responseText}`
+            );
+
+
+            return res.status(502).json({
+                error:
+                    'Invalid response received from Anthropic',
+
+                details:
+                    responseText
+            });
+        }
+
+
+        /*
+         * --------------------------------------------------------
+         * 6. ANTHROPIC ERROR CHECK
+         * --------------------------------------------------------
+         */
+
+        if (!anthropicResponse.ok) {
+
+            logger.error(
+                `Anthropic error ${anthropicResponse.status}: ${JSON.stringify(data)}`
+            );
+
+
+            return res
+                .status(
+                    anthropicResponse.status
+                )
+                .json({
+                    error:
+                        'Anthropic API error',
+
+                    details:
+                        data
+                });
+        }
+
+
+        /*
+         * --------------------------------------------------------
+         * 7. TEXT ANSWER
+         * --------------------------------------------------------
+         */
+
+        const answer =
+            Array.isArray(data.content)
+
+                ? data.content
+
+                    .filter(
+                        (item: any) =>
+                            item &&
+                            item.type === 'text' &&
+                            typeof item.text === 'string'
+                    )
+
+                    .map(
+                        (item: any) =>
+                            item.text
+                    )
+
+                    .join('\n')
+
+                    .trim()
+
+                : '';
+
+
+        /*
+         * --------------------------------------------------------
+         * 8. MCP ARTIFACT EXTRACTION
+         * --------------------------------------------------------
+         */
+
+        const attachments: Array<{
+            artifactId: string;
+            fileName: string;
+            mimeType: string;
+            size?: number;
+        }> = [];
+
+
+        const addedArtifactIds =
+            new Set<string>();
+
+
+        const addArtifact =
+            (value: any): void => {
+
+                if (
+                    !value ||
+                    typeof value !== 'object' ||
+                    value.type !== 'artifact' ||
+                    typeof value.artifactId !== 'string'
+                ) {
+                    return;
+                }
+
+
+                if (
+                    addedArtifactIds.has(
+                        value.artifactId
+                    )
+                ) {
+                    return;
+                }
+
+
+                addedArtifactIds.add(
+                    value.artifactId
+                );
+
+
+                attachments.push({
+
+                    artifactId:
+                        value.artifactId,
+
+                    fileName:
+                        value.fileName ||
+                        'document',
+
+                    mimeType:
+                        value.mimeType ||
+                        'application/octet-stream',
+
+                    size:
+                        typeof value.size === 'number'
+                            ? value.size
+                            : undefined
+                });
+            };
+
+
+        /*
+         * Claude / MCP response nested olabilir.
+         *
+         * mcp_tool_result
+         *   -> content
+         *      -> text
+         *         -> JSON artifact metadata
+         *
+         * Bu yüzden recursive geziyoruz.
+         */
+
+        const inspectContent =
+            (value: any): void => {
+
+                if (
+                    value === null ||
+                    value === undefined
+                ) {
+                    return;
+                }
+
+
+                if (
+                    Array.isArray(value)
+                ) {
+
+                    value.forEach(
+                        inspectContent
+                    );
+
+                    return;
+                }
+
+
+                if (
+                    typeof value !== 'object'
+                ) {
+                    return;
+                }
+
+
+                /*
+                 * Object direkt artifact olabilir.
+                 */
+                addArtifact(value);
+
+
+                /*
+                 * MCP result text içinde JSON
+                 * artifact metadata olabilir.
+                 */
+                if (
+                    typeof value.text === 'string'
+                ) {
+
+                    try {
+
+                        const parsed =
+                            JSON.parse(
+                                value.text
+                            );
+
+
+                        addArtifact(parsed);
+
+                        inspectContent(
+                            parsed
+                        );
+
+                    } catch {
+
+                        /*
+                         * Normal text.
+                         * JSON olmak zorunda değil.
+                         */
+                    }
+                }
+
+
+                /*
+                 * Nested object'leri tara.
+                 */
+                Object.values(value)
+                    .forEach(
+                        inspectContent
+                    );
+            };
+
+
+        inspectContent(
+            data.content
+        );
+
+
+        logger.info(
+            `📎 Claude response contained ${attachments.length} artifact(s)`
+        );
+
+
+        /*
+         * --------------------------------------------------------
+         * 9. EMPTY RESPONSE CHECK
+         * --------------------------------------------------------
+         */
+
+        if (
+            !answer &&
+            attachments.length === 0
+        ) {
+
+            logger.warn(
+                `Anthropic returned no usable answer: ${JSON.stringify(data)}`
+            );
+
+
+            return res.status(502).json({
+                error:
+                    'Claude returned no text answer or artifact',
+
+                raw:
+                    data
+            });
+        }
+
+
+        /*
+         * Artifact oluşmuş ama Claude ayrıca
+         * text dönmemiş olabilir.
+         */
+
+        const finalAnswer =
+            answer ||
+            'Dosya başarıyla oluşturuldu.';
+
+
+        /*
+         * --------------------------------------------------------
+         * 10. RESPONSE TO FIORI
+         * --------------------------------------------------------
+         */
+
+        return res
+            .status(200)
+            .json({
+
+                answer:
+                    finalAnswer,
+
+                attachments,
+
+                discoveredServices:
+                    discoveredServices.length,
+
+                stop_reason:
+                    data.stop_reason,
+
+                usage:
+                    data.usage
+            });
+
+
+    } catch (error) {
+
+        logger.error(
+            `Claude/MCP request failed: ${error}`
+        );
+
+
+        return res.status(500).json({
+
+            error:
+                'Claude/MCP request failed',
+
+            message:
+                error instanceof Error
+                    ? error.message
+                    : String(error)
+        });
+    }
+});
+
+/*
+ * ============================================================
+ * ARTIFACT PREVIEW / DOWNLOAD ENDPOINT
+ * ============================================================
+ */
+
+app.get(
+    '/api/artifacts/:artifactId',
+    (req, res) => {
+
+        try {
+
+            const artifactId =
+                req.params.artifactId;
+
+
+            const artifact =
+                artifactStore.get(
+                    artifactId
+                );
+
+
+            /*
+             * Artifact yok veya süresi dolmuş.
+             */
+            if (!artifact) {
+
+                return res
+                    .status(404)
+                    .json({
+                        error:
+                            'Artifact not found or expired'
+                    });
+            }
+
+
+            /*
+             * ?download=true
+             *
+             * varsa browser indirsin.
+             *
+             * yoksa PDF/image gibi desteklenen
+             * tipleri inline açsın.
+             */
+            const download =
+                req.query.download === 'true';
+
+
+            res.setHeader(
+                'Content-Type',
+                artifact.mimeType
+            );
+
+
+            res.setHeader(
+                'Content-Length',
+                artifact.buffer.length.toString()
+            );
+
+
+            res.setHeader(
+                'Cache-Control',
+                'private, no-store'
+            );
+
+
+            res.setHeader(
+                'Content-Disposition',
+
+                `${
+                    download
+                        ? 'attachment'
+                        : 'inline'
+                }; filename*=UTF-8''${
+                    encodeURIComponent(
+                        artifact.fileName
+                    )
+                }`
+            );
+
+
+            return res.end(
+                artifact.buffer
+            );
+
+
+        } catch (error) {
+
+            logger.error(
+                `Artifact download failed: ${error}`
+            );
+
+
+            return res
+                .status(500)
+                .json({
+
+                    error:
+                        'Artifact download failed',
+
+                    message:
+                        error instanceof Error
+                            ? error.message
+                            : String(error)
+                });
+        }
+    }
+);
+    /*app.post('/api/ask', async (req, res) => {
+        try {
+            const query = req.body?.query;
+
+            if (
+                !query ||
+                typeof query !== 'string' ||
+                query.trim().length === 0
+            ) {
+                return res.status(400).json({
+                    error: 'query is required'
+                });
+            }
+
+            try {
+                await ensureDiscoveryReady();
+
+            } catch (error) {
+                return res.status(503).json({
+                    error: 'SAP service discovery is not ready',
+                    message:
+                        discoveryError ||
+                        (error instanceof Error
+                            ? error.message
+                            : String(error)),
+                    discoveredServices: discoveredServices.length
+                });
+            }
+
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            const mcpServerUrl = process.env.MCP_SERVER_URL;
+
+            if (!apiKey) {
+                return res.status(500).json({
+                    error: 'ANTHROPIC_API_KEY is not configured'
+                });
+            }
+
+            if (!mcpServerUrl) {
+                return res.status(500).json({
+                    error: 'MCP_SERVER_URL is not configured'
+                });
+            }
+
+            const body = {
+                model: 'claude-sonnet-4-6',
+                max_tokens: 6000,
+
+                system: `
+You are an SAP assistant connected to a real SAP system through the sap-mcp MCP server.
+
+For questions about SAP data, OData services, entities, metadata or SAP operations, use the sap-mcp tools.
+
+Never invent SAP services, entities, properties, values or records.
+
+Use only information returned by the connected SAP MCP server when answering SAP-specific questions.
+
+If the user asks for OData services, use the MCP discovery tools.
+
+If the user asks to list OData services, return the actual discovered service names.
+
+If the user asks for entities or properties of a service, inspect that service through MCP before answering.
+
+If an SAP or MCP operation fails, clearly report the real error instead of guessing.
+
+Do not claim that no SAP services are available unless the MCP tool actually reports zero available services.
+
+When the user explicitly asks for a PDF, Word document, text file,
+downloadable report, export or generated document:
+
+1. Retrieve the required SAP data first using the SAP MCP tools.
+2. Prepare the report using only the retrieved SAP data.
+3. Call the create-report-artifact MCP tool.
+4. Use the file format requested by the user.
+5. Do not generate base64 yourself.
+6. Do not claim that a file was generated unless the artifact tool succeeds.
+7. After the artifact is created, briefly tell the user that the file is ready.
+`,
+
+                messages: [
+                    {
+                        role: 'user',
+                        content: query.trim()
+                    }
+                ],
+
+                mcp_servers: [
+                    {
+                        type: 'url',
+                        url: mcpServerUrl,
+                        name: 'sap-mcp'
+                    }
+                ],
+
+                tools: [
+                    {
+                        type: 'mcp_toolset',
+                        mcp_server_name: 'sap-mcp'
+                    }
+                ]
+            };
+
+            const anthropicResponse = await fetch(
+                'https://api.anthropic.com/v1/messages',
+                {
+                    method: 'POST',
+
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-api-key': apiKey,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-beta': 'mcp-client-2025-11-20'
+                    },
+
+                    body: JSON.stringify(body)
+                }
+            );
+
+            const responseText =
+                await anthropicResponse.text();
+
+            let data: any;
+
+            try {
+                data = JSON.parse(responseText);
+
+            } catch {
+                logger.error(
+                    `Anthropic returned invalid JSON: ${responseText}`
+                );
+
+                return res.status(502).json({
+                    error: 'Invalid response received from Anthropic',
+                    details: responseText
+                });
+            }
+
+            if (!anthropicResponse.ok) {
+                logger.error(
+                    `Anthropic error ${anthropicResponse.status}: ${JSON.stringify(data)}`
+                );
+
+                return res
+                    .status(anthropicResponse.status)
+                    .json({
+                        error: 'Anthropic API error',
+                        details: data
+                    });
+            }
+
+            const answer =
+                Array.isArray(data.content)
+                    ? data.content
+                        .filter(
+                            (item: any) =>
+                                item &&
+                                item.type === 'text' &&
+                                typeof item.text === 'string'
+                        )
+                        .map((item: any) => item.text)
+                        .join('\n')
+                        .trim()
+                    : '';
+
+                    const attachments: Array<{
+    artifactId: string;
+    fileName: string;
+    mimeType: string;
+    size?: number;
+}> = [];
+
+const addedArtifactIds = new Set<string>();
+
+const addArtifact = (value: any): void => {
+
+    if (
+        !value ||
+        typeof value !== 'object' ||
+        value.type !== 'artifact' ||
+        typeof value.artifactId !== 'string'
+    ) {
+        return;
+    }
+
+    if (addedArtifactIds.has(value.artifactId)) {
+        return;
+    }
+
+    addedArtifactIds.add(value.artifactId);
+
+    attachments.push({
+        artifactId: value.artifactId,
+        fileName: value.fileName || 'document',
+        mimeType:
+            value.mimeType ||
+            'application/octet-stream',
+        size:
+            typeof value.size === 'number'
+                ? value.size
+                : undefined
+    });
+};
+
+const inspectContent = (value: any): void => {
+
+    if (!value) {
+        return;
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach(inspectContent);
+        return;
+    }
+
+    if (typeof value !== 'object') {
+        return;
+    }
+
+    addArtifact(value);
+
+    if (typeof value.text === 'string') {
+
+        try {
+
+            const parsed =
+                JSON.parse(value.text);
+
+            addArtifact(parsed);
+            inspectContent(parsed);
+
+        } catch {
+        }
+    }
+
+    Object.values(value)
+        .forEach(inspectContent);
+};
+
+inspectContent(data.content);
+
+logger.info(
+    `📎 Claude response contained ${attachments.length} artifact(s)`
+);
+
+           if (!answer && attachments.length === 0) {
+
+    logger.warn(
+        `Anthropic returned no usable answer: ${JSON.stringify(data)}`
+    );
+
+    return res.status(502).json({
+        error: 'Claude returned no text answer or artifact',
+        raw: data
+    });
+}
+
+const finalAnswer =
+    answer ||
+    'Dosya başarıyla oluşturuldu.';
+
+            return res.status(200).json({
+    answer: finalAnswer,
+    attachments,
+    discoveredServices: discoveredServices.length,
+    stop_reason: data.stop_reason,
+    usage: data.usage
+});
+
+        } catch (error) {
+            logger.error(`Claude/MCP request failed: ${error}`);
+
+            return res.status(500).json({
+                error: 'Claude/MCP request failed',
+                message:
+                    error instanceof Error
+                        ? error.message
+                        : String(error)
+            });
+        }
+    });*/
+
+
+    /*app.post('/api/ask', async (req, res) => {
+        try {
+            const query = req.body?.query;
+
+            if (!query || typeof query !== 'string') {
+                return res.status(400).json({
+                    error: 'query is required'
+                });
+            }
+
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            const mcpServerUrl = process.env.MCP_SERVER_URL;
+
+            if (!apiKey) {
+                return res.status(500).json({
+                    error: 'ANTHROPIC_API_KEY is not configured'
+                });
+            }
+
+            if (!mcpServerUrl) {
+                return res.status(500).json({
+                    error: 'MCP_SERVER_URL is not configured'
+                });
+            }
+
+            const body = {
+                model: 'claude-sonnet-4-6',
+                max_tokens: 1000,
+
+                messages: [
+                    {
+                        role: 'user',
+                        content: query
+                    }
+                ],
+
+                mcp_servers: [
+                    {
+                        type: 'url',
+                        url: mcpServerUrl,
+                        name: 'sap-mcp'
+                    }
+                ],
+
+                tools: [
+                    {
+                        type: 'mcp_toolset',
+                        mcp_server_name: 'sap-mcp'
+                    }
+                ]
+            };
+
+            const anthropicResponse = await fetch(
+                'https://api.anthropic.com/v1/messages',
+                {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-api-key': apiKey,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-beta': 'mcp-client-2025-11-20'
+                    },
+                    body: JSON.stringify(body)
+                }
+            );
+
+            const data: any = await anthropicResponse.json();
+
+            if (!anthropicResponse.ok) {
+                logger.error(
+                    `Anthropic error ${anthropicResponse.status}: ${JSON.stringify(data)}`
+                );
+
+                return res.status(anthropicResponse.status).json({
+                    error: 'Anthropic API error',
+                    details: data
+                });
+            }
+
+            const answer =
+                Array.isArray(data.content)
+                    ? data.content
+                        .filter((item: any) => item.type === 'text')
+                        .map((item: any) => item.text)
+                        .join('\n')
+                    : '';
+
+            return res.json({
+                answer,
+                stop_reason: data.stop_reason,
+                usage: data.usage,
+                raw: data
+            });
+
+        } catch (error) {
+            logger.error(`Claude/MCP request failed: ${error}`);
+
+            return res.status(500).json({
+                error: error instanceof Error
+                    ? error.message
+                    : String(error)
+            });
+        }
+    });*/
+    /*app.post('/api/ask', async (req, res) => {
+        try {
+            const query = req.body?.query;
+
+            if (!query || typeof query !== 'string') {
+                return res.status(400).json({
+                    error: 'query is required'
+                });
+            }
+
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+
+            if (!apiKey) {
+                return res.status(500).json({
+                    error: 'ANTHROPIC_API_KEY is not configured'
+                });
+            }
+
+            const anthropicResponse = await fetch(
+                'https://api.anthropic.com/v1/messages',
+                {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-api-key': apiKey,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify({
+                        model: 'claude-sonnet-4-5',
+                        max_tokens: 500,
+                        messages: [
+                            {
+                                role: 'user',
+                                content: query
+                            }
+                        ]
+                    })
+                }
+            );
+
+            const data: any = await anthropicResponse.json();
+
+            if (!anthropicResponse.ok) {
+                return res.status(anthropicResponse.status).json({
+                    error: 'Anthropic API error',
+                    details: data
+                });
+            }
+
+            const text =
+                Array.isArray(data.content)
+                    ? data.content
+                        .filter((item: any) => item.type === 'text')
+                        .map((item: any) => item.text)
+                        .join('\n')
+                    : '';
+
+            return res.json({
+                answer: text,
+                raw: data
+            });
+
+        } catch (error) {
+            logger.error('Claude request failed:', error);
+
+            return res.status(500).json({
+                error: error instanceof Error
+                    ? error.message
+                    : String(error)
+            });
+        }
+    });*/
 
     // MCP server info endpoint - Authentication-aware response
     app.get('/mcp', authService.optionalAuthenticateJWT() as express.RequestHandler, (req, res) => {
@@ -305,7 +1540,49 @@ export function createApp(): express.Application {
 
     // Main MCP endpoint - handles all MCP communication
     // SECURITY: Optional authentication - allows Claude Desktop to connect without OAuth
-    app.post('/mcp', authService.authenticateJWT() as express.RequestHandler, async (req, res) => {
+    app.post('/mcp', async (req, res) => {
+        const authReq = req as AuthRequest;
+
+        try {
+            const sessionId = authReq.headers['mcp-session-id'] as string | undefined;
+            let session;
+
+            if (sessionId && sessions.has(sessionId)) {
+                session = await getOrCreateSession(sessionId);
+            } else if (!sessionId && isInitializeRequest(authReq.body)) {
+                session = await getOrCreateSession();
+            } else {
+                logger.warn(`❌ Invalid MCP request - no session ID and not initialize request`);
+
+                return res.status(400).json({
+                    jsonrpc: '2.0',
+                    error: {
+                        code: -32000,
+                        message: 'Bad Request: No valid session ID provided or not an initialize request'
+                    },
+                    id: authReq.body?.id || null
+                });
+            }
+
+            await session.transport.handleRequest(authReq, res, authReq.body);
+
+        } catch (error) {
+            logger.error('❌ Error handling MCP request:', error);
+
+            if (!res.headersSent) {
+                res.status(500).json({
+                    jsonrpc: '2.0',
+                    error: {
+                        code: -32603,
+                        message: `Internal server error: ${error instanceof Error ? error.message : 'Unknown error'
+                            }`
+                    },
+                    id: authReq.body?.id || null
+                });
+            }
+        }
+    });
+    /*app.post('/mcp', authService.authenticateJWT() as express.RequestHandler, async (req, res) => {
         const authReq = req as AuthRequest;
         try {
             // Get session ID from header
@@ -348,7 +1625,7 @@ export function createApp(): express.Application {
                 });
             }
         }
-    });
+    });*/
 
     // Handle GET requests for server-to-client notifications via SSE
     app.get('/mcp', async (req, res) => {
@@ -1141,13 +2418,31 @@ export async function startServer(port: number = 3000): Promise<void> {
                 logger.info('🚀 Initializing Modern SAP MCP Server...');
 
                 // Initialize destination service
-                await destinationService.initialize();
+                /*await destinationService.initialize();
 
                 // Discover SAP OData services
                 logger.info('🔍 Discovering SAP OData services...');
                 discoveredServices = await sapDiscoveryService.discoverAllServices();
 
                 logger.info(`✅ Discovered ${discoveredServices.length} OData services`);
+                resolve();*/
+                logger.info('🚀 Starting SAP OData discovery...');
+
+                void ensureDiscoveryReady()
+                    .then(() => {
+                        logger.info(
+                            `✅ Startup discovery ready with ${discoveredServices.length} services`
+                        );
+                    })
+                    .catch((error) => {
+                        logger.error(
+                            `❌ Startup discovery failed: ${error instanceof Error
+                                ? error.message
+                                : String(error)
+                            }`
+                        );
+                    });
+
                 resolve();
             });
 

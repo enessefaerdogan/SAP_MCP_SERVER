@@ -73,7 +73,7 @@ export class Config {
         this.config.set('odata.discoveryMode', process.env.ODATA_DISCOVERY_MODE || 'whitelist');
 
         // Maximum services to discover (prevents overwhelming the system)
-        this.config.set('odata.maxServices', parseInt(process.env.ODATA_MAX_SERVICES || '50'));
+        this.config.set('odata.maxServices', parseInt(process.env.ODATA_MAX_SERVICES || '500'));
     }
 
     get<T = string>(key: string, defaultValue?: T): T {
@@ -174,7 +174,7 @@ export class Config {
      * Get the maximum number of services to discover
      */
     getMaxServices(): number {
-        return this.get('odata.maxServices', 50);
+        return this.get('odata.maxServices', 500);
     }
 
     /**
@@ -186,7 +186,7 @@ export class Config {
             discoveryMode: this.get('odata.discoveryMode', 'whitelist'),
             servicePatterns: this.get('odata.servicePatterns', []),
             exclusionPatterns: this.get('odata.exclusionPatterns', []),
-            maxServices: this.get('odata.maxServices', 50)
+            maxServices: this.get('odata.maxServices', 500)
         };
     }
 }
